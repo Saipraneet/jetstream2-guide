@@ -11,7 +11,7 @@
 set -euo pipefail
 case "${1:-}" in
   mount)
-vid="${1:?volume id}"; mnt="${2:-/workspace}"
+vid="${2:?volume id}"; mnt="${3:-/workspace}"
 serial="${vid:0:20}"
 dev=""
 for _ in $(seq 1 30); do

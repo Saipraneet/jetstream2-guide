@@ -12,7 +12,7 @@ roughly how long. `js2 stop` shelves; `js2 kill`/`js2 finish` delete. Never leav
 **Course budget (CSCI 567): each team has a hard cap of 10,000 SUs, about 90 GPU-hours. There is no top-up.**
 Before launching, estimate SUs = rate x hours (h100 128/h, a100 64/h, a100-20 32/h, a100-10 16/h) and say it.
 Prefer the smallest flavor that fits; develop on `a100-10`/`a100-20` and move to a big card only for the real run.
-Check spend in Exosphere (Allocations page) before any run over an hour. See the repo README for details.
+Check spend in Exosphere before any run over an hour. The README is the first-session guide; docs/reference.md has the full command list.
 
 Three files in this skill's `scripts/`: `js2` (symlinked to `~/bin/js2` by the repo's `install.sh`; call it by
 full path if `~/bin` is not on PATH) wraps the `openstack` CLI (`~/bin/openstack`, cloud from `~/.config/openstack/clouds.yaml`);
@@ -48,8 +48,8 @@ volume 1m46s, `setup venv` ~4 min, `setup sft` ~6 min, shelve 33 s, unshelve 68 
 |---|---|---|---|---|---|
 | `h100` | g5.xl | 1x H100 80 GB SXM | 20 / 235 GB | <=70B FP8/4-bit, <=32B bf16 | util 0.95, seqs 1024, batched 16384 |
 | `a100` | g3.xl | 1x A100 **40 GB** | 32 / 117 GB | <=14B bf16, <=32B FP8 | util 0.92, seqs 512, batched 4096 |
-| `a100-20` | g3.large | A100 20 GB vGPU slice | 16 / 60 GB | <=8B bf16, <=14B 4-bit | util 0.90, seqs 256, batched 4096 |
-| `a100-10` | g3.medium | A100 10 GB vGPU slice | 8 / 30 GB | <=3B bf16, <=8B 4-bit | util 0.90, seqs 128, batched 2048 |
+| `a100-20` | g3.large | A100 20 GB vGPU slice | 16 / 60 GB | <=8B bf16, <=14B 4-bit | util 0.85, seqs 256, batched 4096 |
+| `a100-10` | g3.medium | A100 10 GB vGPU slice | 8 / 30 GB | <=3B bf16, <=8B 4-bit | util 0.80, seqs 128, batched 2048 |
 | `cpu` / `tiny` | m3.medium / m3.tiny | none | 8 / 30 GB, 1 / 3 GB | orchestration / lifecycle tests | |
 
 - `js2 serve` adds the three flags only when you did not pass them, and prints the final command. Always set
@@ -59,7 +59,7 @@ volume 1m46s, `setup venv` ~4 min, `setup sft` ~6 min, shelve 33 s, unshelve 68 
 - **Multi-GPU:** this allocation exposes single-GPU flavors only. If a multi-H100 flavor appears in
   `openstack flavor list`, pass its name; `serve` then adds `--tensor-parallel-size N` (use `--data-parallel-size`
   if the model fits one card). Otherwise scale out: N `h100` instances, `JS2_LOCAL_PORT=800N js2 serve run-N ...`.
-- Slices are vGPU profiles, not MIG: a plain CUDA device with 10/20 GB. Quota: 214 cores (~10 H100 instances),
+- Slices are vGPU profiles, not MIG: a plain CUDA device with 10/20 GB, of which ~1.3 GB is reserved (free 8.7 GB on the 10 GB slice). Quota: 214 cores (~10 H100 instances),
   25 instances, 10 volumes / 1000 GB.
 - Run each model at its released precision (FP8/MXFP4/...): no `--dtype`, never re-quantize; record what loaded.
 

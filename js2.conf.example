@@ -1,6 +1,6 @@
 # ~/.jetstream2/js2.conf - account defaults for js2 (shell syntax). install.sh copies this file there.
 OS_CLOUD=openstack            # cloud name inside ~/.config/openstack/clouds.yaml (install.sh fills this)
-KEY_NAME=                     # REQUIRED: name of your keypair on Jetstream2 (openstack keypair list)
+KEY_NAME=""                   # REQUIRED: your keypair name on Jetstream2 (install.sh lists them); keep the quotes, names may contain spaces
 SSH_KEY=$HOME/.ssh/id_ed25519 # private key matching that keypair
 IMAGE=Featured-Ubuntu24
 FLAVOR=a100-10                # default flavor for `js2 launch` (cheapest GPU, 16 SU/h); pass a flavor explicitly for bigger runs

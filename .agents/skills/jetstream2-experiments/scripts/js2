@@ -107,8 +107,11 @@ ssh_dest() {  # sets IP for $1, waiting until SSH answers (cloud-init on feature
     ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$SSH_USER@$IP" true 2>/dev/null && return 0
     sleep 10
   done
-  echo "SSH to $SSH_USER@$IP not ready after 15 min" >&2; return 1
+  echo "SSH to $SSH_USER@$IP not ready after 15 min" >&2
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$SSH_USER@$IP" true 2>&1 | grep -q 'HOST IDENTIFICATION HAS CHANGED' && echo "  host key changed (reused floating IP): run  ssh-keygen -R $IP -f ~/.jetstream2/known_hosts  and retry" >&2
+  return 1
 }
+forget_host() { ssh-keygen -R "$1" -f "$HOME/.jetstream2/known_hosts" >/dev/null 2>&1 || true; }
 rssh() { ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" "$@"; }
 rscp() { scp "${SSH_OPTS[@]}" "$@"; }
 
@@ -189,6 +192,7 @@ case "$cmd" in
     wait_status "$name" ACTIVE 900 || { echo "create failed - instance left for inspection: js2 kill $name" >&2; exit 1; }
     fip=$("$OSC" floating ip create public -f value -c floating_ip_address)
     "$OSC" server add floating ip "$name" "$fip"
+    forget_host "$fip"   # floating IPs are reused: a stale host key from an earlier instance would block SSH
     echo "floating IP $fip; waiting for SSH..."
     ssh_dest "$name"
     case "$vol" in
@@ -266,7 +270,7 @@ for s in json.loads(srv):
     model="${1:?usage: js2 serve [inst] <model> [vllm args...]}"; shift || true
     ssh_dest "$inst"
     # GPU-aware defaults so the card is fully used (override any of them by passing the flag yourself):
-    #   g3.medium/large = A100 vGPU slice (10/20 GB): util 0.90, small batches
+    #   g3.medium/large = A100 vGPU slice (10/20 GB): util 0.80/0.85 (slice reserves ~1.3 GB; 0.90 fails), small batches
     #   g3.xl = A100 40 GB: util 0.92, vLLM's A100 defaults are conservative -> seqs 512, batched tokens 4096
     #   g5.xl = H100 80 GB: util 0.95, seqs 1024, batched tokens 16384
     #   >1 GPU (multi-GPU flavor) and no -tp/-dp given: tensor-parallel over all of them
@@ -279,8 +283,8 @@ for s in json.loads(srv):
     grep -q -- '--max-model-len' <<<"$*" || echo "WARNING: no --max-model-len: vLLM uses the model's maximum context, which shrinks concurrency. Set it from the task (see skill)." >&2
     if   [ "${mem:-0}" -ge 70000 ]; then util=0.95; seqs=1024; btok=16384
     elif [ "${mem:-0}" -ge 30000 ]; then util=0.92; seqs=512;  btok=4096
-    elif [ "${mem:-0}" -ge 15000 ]; then util=0.90; seqs=256;  btok=4096
-    else                                 util=0.90; seqs=128;  btok=2048; fi
+    elif [ "${mem:-0}" -ge 15000 ]; then util=0.85; seqs=256;  btok=4096   # vGPU slices: ~1.3 GB is reserved, so 0.90 fails
+    else                                 util=0.80; seqs=128;  btok=2048; fi
     grep -q -- '--gpu-memory-utilization' <<<"$*" || set -- "$@" --gpu-memory-utilization "$util"
     grep -q -- '--max-num-seqs' <<<"$*" || set -- "$@" --max-num-seqs "$seqs"
     grep -q -- '--max-num-batched-tokens' <<<"$*" || set -- "$@" --max-num-batched-tokens "$btok"

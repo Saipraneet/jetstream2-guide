@@ -14,4 +14,5 @@ Rules that apply in every session:
 - **Code goes up, results come down, never the reverse.** Use `js2 push-code` and `js2 pull-results`; `js2 up`
   and `js2 down` overwrite whole trees and need an explicit request.
 - Run `js2` by full path (`~/bin/js2`) if `~/bin` is not on PATH. Account config is in `~/.jetstream2/js2.conf`.
-- The README is the student-facing document; keep it and SKILL.md consistent when changing either.
+- README.md is the first-timer guide (one path, few commands), docs/reference.md the full reference; keep both
+  and SKILL.md consistent when changing any of them, and keep the README simple.
