@@ -1,0 +1,9 @@
+# ~/.jetstream2/js2.conf - account defaults for js2 (shell syntax). install.sh copies this file there.
+OS_CLOUD=openstack            # cloud name inside ~/.config/openstack/clouds.yaml (install.sh fills this)
+KEY_NAME=                     # REQUIRED: name of your keypair on Jetstream2 (openstack keypair list)
+SSH_KEY=$HOME/.ssh/id_ed25519 # private key matching that keypair
+IMAGE=Featured-Ubuntu24
+FLAVOR=a100-10                # default flavor for `js2 launch` (cheapest GPU, 16 SU/h); pass a flavor explicitly for bigger runs
+VOLUME_GB=100                 # default size of the volume `js2 launch` creates (course quota: 1000 GB per team)
+# Per-project overrides go in <repo>/.js2.conf: EXP_LOCAL (dir to sync, default <git root>/experiments or the
+# git root) and EXP_REMOTE (its path on the instance, default /workspace/<project dirname>).

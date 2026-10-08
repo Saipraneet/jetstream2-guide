@@ -1,0 +1,384 @@
+#!/usr/bin/env bash
+# js2 - Jetstream2 (OpenStack) GPU-instance helper (see SKILL.md next to this scripts/ dir and the repo README)
+# Lives in <repo>/.agents/skills/jetstream2-experiments/scripts/; install.sh symlinks ~/bin/js2 to it.
+#   js2 launch [name] [flavor] [volume]  create instance (default flavor $FLAVOR from js2.conf, else h100), floating IP, wait for
+#                           SSH; attach+mount `volume` at /workspace (name|id; "new[:GB]" creates one, default
+#                           250 GB; "none" skips). flavor aliases: h100|g5.xl, a100|g3.xl, a100-20|g3.large,
+#                           a100-10|g3.medium, cpu|m3.medium, tiny|m3.tiny, or any flavor name
+#   js2 list                instances (name, status, flavor, IP, volumes)
+#   js2 status [inst]       one instance in detail
+#   js2 gpus [inst]         the instance's GPUs (name, total/used memory)
+#   js2 setup [inst] [venv|docker|sft]  venv: uv venv + vLLM on /workspace/venv (default). docker: nvidia
+#                           container toolkit + pull vllm/vllm-openai. sft: /workspace/venv_sft with
+#                           torch, TRL, PEFT, bitsandbytes, unsloth. Idempotent.
+#   js2 ft [inst] defaults|bench|train sft|dpo|grpo [args]  fine-tuning (js2_ft.py in venv_sft; needs setup sft):
+#                           defaults = print the config for this GPU+model; bench = largest batch + tok/s;
+#                           train --dataset D [--reward f.py:fn] = run with the defaults (--set k=v overrides)
+#   js2 ssh [inst] [cmd...] interactive SSH (or run cmd)
+#   js2 push-code [inst]    SOURCE ONLY local -> instance, verified (cannot touch results)
+#   js2 pull-results [inst] [subpath]  RESULTS ONLY instance -> local, verified (cannot touch source)
+#   js2 serve [inst] <model> [vllm args...]  vLLM server in tmux (venv, or docker if no venv) + SSH tunnel
+#   js2 tunnel [inst]       (re)open SSH tunnel: localhost:8000 -> instance's vLLM server
+#   js2 stop [inst]         SHELVE: stops SU billing, keeps disk, volume and IP. (`openstack server stop` still bills)
+#   js2 start [inst]        unshelve a shelved instance and wait for SSH (remounts /workspace)
+#   js2 finish [inst]       pull-results + verify + delete instance (volume survives)
+#   js2 kill [inst]         delete instance + release its floating IP (volume survives, detached)
+#   js2 vol list|create <name> [GB]|attach [inst] <vol>|detach [inst] <vol>|delete <vol>
+#   js2 up [inst] / js2 down [inst] [subpath]   DANGEROUS whole-tree sync (see skill)
+# [inst] may be omitted when exactly one instance exists.
+#
+# Config: ~/.jetstream2/js2.conf (account defaults), then nearest .js2.conf upward from cwd.
+# Variables: OS_CLOUD, KEY_NAME, SSH_KEY, IMAGE, FLAVOR (default flavor), NETWORK, SECGROUPS, VOLUME_GB, VOLUME (default volume to attach),
+# EXP_LOCAL (local dir to sync), EXP_REMOTE (its path on the instance).
+set -euo pipefail
+
+OSC="${OPENSTACK_BIN:-$HOME/bin/openstack}"
+[ -x "$OSC" ] || OSC=$(command -v openstack || true)
+[ -n "$OSC" ] || { echo "openstack CLI not found: run install.sh from the jetstream2-guide repo" >&2; exit 1; }
+[ -f "$HOME/.jetstream2/js2.conf" ] && . "$HOME/.jetstream2/js2.conf"
+d="$PWD"
+while [ "$d" != "/" ]; do
+  if [ -f "$d/.js2.conf" ]; then . "$d/.js2.conf"; PROJECT_ROOT="$d"; break; fi
+  d=$(dirname "$d")
+done
+PROJECT_ROOT="${PROJECT_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")}"
+SKILL_SCRIPTS="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export OS_CLOUD="${OS_CLOUD:-$(python3 -c 'import yaml,os; print(next(iter(yaml.safe_load(open(os.path.expanduser("~/.config/openstack/clouds.yaml")))["clouds"])))' 2>/dev/null || true)}"
+[ -n "$OS_CLOUD" ] || { echo "no OS_CLOUD: set it in ~/.jetstream2/js2.conf (a cloud name from ~/.config/openstack/clouds.yaml)" >&2; exit 1; }
+KEY_NAME="${KEY_NAME:-}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+SSH_USER="${SSH_USER:-ubuntu}"
+IMAGE="${IMAGE:-Featured-Ubuntu24}"
+NETWORK="${NETWORK:-auto_allocated_network}"
+SECGROUPS="${SECGROUPS:-exosphere}"   # Jetstream2's "exosphere" group opens 22/tcp; "default" opens nothing inbound
+VOLUME_GB="${VOLUME_GB:-250}"
+VOLUME="${VOLUME:-new}"
+MOUNT="/workspace"
+if [ -z "${EXP_LOCAL:-}" ]; then
+  if [ -d "$PROJECT_ROOT/experiments" ]; then EXP_LOCAL="$PROJECT_ROOT/experiments"; else EXP_LOCAL="$PROJECT_ROOT"; fi
+fi
+EXP_REMOTE="${EXP_REMOTE:-$MOUNT/$(basename "$PROJECT_ROOT")}"
+SSH_OPTS=( -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$HOME/.jetstream2/known_hosts" -o ConnectTimeout=10 )
+
+flavor_id() {
+  case "${1:-h100}" in
+    h100) echo g5.xl ;; a100) echo g3.xl ;; a100-20) echo g3.large ;; a100-10) echo g3.medium ;;
+    cpu) echo m3.medium ;; tiny) echo m3.tiny ;; *) echo "$1" ;;
+  esac
+}
+
+servers_json() { "$OSC" server list --long -f json; }
+is_inst() {  # true if $1 names/ids an existing instance
+  [ -n "${1:-}" ] && servers_json | python3 -c '
+import json,sys; sys.exit(0 if any(s["Name"]==sys.argv[1] or s["ID"]==sys.argv[1] for s in json.load(sys.stdin)) else 1)' "$1"
+}
+resolve_inst() {  # echo instance name; $1 if it exists, else the only instance
+  if is_inst "${1:-}"; then echo "$1"; return; fi
+  servers_json | python3 -c '
+import json,sys
+s=json.load(sys.stdin)
+if len(s)==1: print(s[0]["Name"])
+else: sys.exit("%d instances exist - pass a name:\n%s" % (len(s), "\n".join("  %-20s %s" % (x["Name"], x["Status"]) for x in s)))'
+}
+inst_ip() {  # public (floating) IP of $1; empty if none
+  "$OSC" server show "$1" -f json -c addresses | python3 -c '
+import json,sys,ipaddress
+for ips in json.load(sys.stdin)["addresses"].values():
+    for ip in ips:
+        if ipaddress.ip_address(ip).is_global: print(ip); sys.exit()'
+}
+inst_status() { "$OSC" server show "$1" -f value -c status; }
+
+wait_status() {  # wait_status <inst> <STATUS> [timeout_s]
+  local inst="$1" want="$2" t="${3:-600}" st
+  for _ in $(seq 1 $((t/10))); do
+    st=$(inst_status "$inst")
+    [ "$st" = "$want" ] && return 0
+    [ "$st" = "ERROR" ] && { echo "instance $inst is in ERROR:" >&2; "$OSC" server show "$inst" -f value -c fault >&2; return 1; }
+    sleep 10
+  done
+  echo "timeout waiting for $inst to be $want (is $st)" >&2; return 1
+}
+ssh_dest() {  # sets IP for $1, waiting until SSH answers (cloud-init on featured images takes ~2-4 min)
+  local inst="$1"
+  IP=$(inst_ip "$inst")
+  [ -n "$IP" ] || { echo "$inst has no floating IP (status $(inst_status "$inst")); js2 start it?" >&2; return 1; }
+  for _ in $(seq 1 90); do
+    ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$SSH_USER@$IP" true 2>/dev/null && return 0
+    sleep 10
+  done
+  echo "SSH to $SSH_USER@$IP not ready after 15 min" >&2; return 1
+}
+rssh() { ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" "$@"; }
+rscp() { scp "${SSH_OPTS[@]}" "$@"; }
+
+vol_id() { "$OSC" volume show "$1" -f value -c id; }
+vol_attached_to() { "$OSC" volume show "$1" -f json -c attachments | python3 -c 'import json,sys; a=json.load(sys.stdin)["attachments"]; print(a[0]["server_id"] if a else "")'; }
+mount_volume() {  # mount_volume <inst> <vol> : attach (if needed) and mount at $MOUNT (format if blank); needs ssh_dest
+  local inst="$1" vol="$2" vid sid
+  vid=$(vol_id "$vol")
+  sid=$("$OSC" server show "$inst" -f value -c id)
+  if [ "$(vol_attached_to "$vid")" != "$sid" ]; then
+    [ -z "$(vol_attached_to "$vid")" ] || { echo "volume $vol is attached to another instance" >&2; return 1; }
+    "$OSC" server add volume "$inst" "$vid" >/dev/null
+    for _ in $(seq 1 30); do [ "$("$OSC" volume show "$vid" -f value -c status)" = in-use ] && break; sleep 5; done
+  fi
+  rscp "$SKILL_SCRIPTS/js2_remote.sh" "$SSH_USER@$IP:/tmp/js2_remote.sh"
+  rssh "sudo bash /tmp/js2_remote.sh mount '$vid' '$MOUNT'"
+}
+
+# Source vs results split (same discipline as rp): code goes up, results come down, never the reverse.
+CODE_PAT=( --include '*/' --include '*.py' --include '*.sh' --include '*.md'
+           --include '*.txt' --include '*.toml' --include '*.cfg' --include '*.yaml'
+           --include '*.yml' --exclude '*' )
+RESULT_PAT=( --exclude '*.py' --exclude '*.sh' --exclude '*.md' --exclude '*.txt'
+             --exclude '*.toml' --exclude '*.cfg' --exclude '*.yaml' --exclude '*.yml' )
+COMMON_EX=( --no-owner --no-group --exclude '.git' --exclude '__pycache__'
+            --exclude '.venv*' --exclude 'venv' )
+RSYNC_SSH="ssh ${SSH_OPTS[*]}"
+
+verify_sync() {  # $1=src $2=dst $3...=filter; re-runs rsync with --checksum --dry-run
+  local src="$1" dst="$2"; shift 2
+  local out
+  out=$(rsync -rc --dry-run "${COMMON_EX[@]}" "$@" -e "$RSYNC_SSH" "$src" "$dst" \
+        | grep -vE '^(sending|sent |total size|building file list|created directory|\./$|$)' \
+        | grep -v '/$' || true)
+  if [ -n "$out" ]; then echo "VERIFY FAILED - these differ after sync:" >&2; echo "$out" >&2; return 1; fi
+  echo "verified: source and destination agree"
+}
+check_stale_pulls() {  # auto-revert pulled tracked files whose content matches a commit older than HEAD
+  local pulled="$1" root relroot f cur head match c
+  root=$(git -C "$pulled" rev-parse --show-toplevel 2>/dev/null) || return 0
+  relroot=$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$pulled" "$root")
+  local reverted=()
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue; [ -f "$root/$f" ] || continue
+    cur=$(git -C "$root" hash-object "$root/$f"); head=$(git -C "$root" rev-parse "HEAD:$f" 2>/dev/null || true)
+    [ "$cur" = "$head" ] && continue
+    match=""
+    while IFS= read -r c; do
+      [ -z "$c" ] && continue
+      if [ "$(git -C "$root" rev-parse "$c:$f" 2>/dev/null || true)" = "$cur" ]; then match="$c"; break; fi
+    done < <(git -C "$root" log --format=%H -- "$f")
+    if [ -n "$match" ]; then git -C "$root" checkout -- "$f"; reverted+=("$f  (matches ${match:0:9}, older than HEAD)"); fi
+  done < <(git -C "$root" diff --name-only -- "$relroot")
+  if [ "${#reverted[@]}" -gt 0 ]; then
+    echo "AUTO-REVERTED stale pull(s) - pulled content matched an old commit, not HEAD:" >&2
+    printf '  %s\n' "${reverted[@]}" >&2
+    echo "  (the volume is still stale for these - push the fixed files up once to stop this recurring)" >&2
+  fi
+}
+
+pick_inst() {  # sets inst from $1 if it names one (and shifts), else the only one. Usage: pick_inst "$@"; shift $SHIFTED
+  if is_inst "${1:-}"; then inst="$1"; SHIFTED=1; else inst=$(resolve_inst ""); SHIFTED=0; fi
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  launch)
+    name="${1:-exp-$(date +%m%d-%H%M)}"
+    flavor=$(flavor_id "${2:-${FLAVOR:-h100}}")
+    vol="${3:-$VOLUME}"
+    [ -n "$KEY_NAME" ] || { echo "set KEY_NAME in ~/.jetstream2/js2.conf (openstack keypair list)" >&2; exit 1; }
+    is_inst "$name" && { echo "instance $name already exists" >&2; exit 1; }
+    sg_args=(); for g in ${SECGROUPS//,/ }; do sg_args+=( --security-group "$g" ); done
+    echo "creating $name ($flavor, $IMAGE)..."
+    "$OSC" server create --flavor "$flavor" --image "$IMAGE" --key-name "$KEY_NAME" \
+      --network "$NETWORK" "${sg_args[@]}" \
+      --property js2_created_by=js2 "$name" -f value -c id >/dev/null
+    wait_status "$name" ACTIVE 900 || { echo "create failed - instance left for inspection: js2 kill $name" >&2; exit 1; }
+    fip=$("$OSC" floating ip create public -f value -c floating_ip_address)
+    "$OSC" server add floating ip "$name" "$fip"
+    echo "floating IP $fip; waiting for SSH..."
+    ssh_dest "$name"
+    case "$vol" in
+      none|"") ;;
+      new|new:*) gb="${vol#new}"; gb="${gb#:}"; gb="${gb:-$VOLUME_GB}"
+        vname="$name-vol"
+        echo "creating volume $vname (${gb} GB)..."
+        "$OSC" volume create --size "$gb" "$vname" -f value -c id >/dev/null
+        for _ in $(seq 1 30); do [ "$("$OSC" volume show "$vname" -f value -c status)" = available ] && break; sleep 3; done
+        mount_volume "$name" "$vname" ;;
+      *) mount_volume "$name" "$vol" ;;
+    esac
+    echo "ready: ssh $SSH_USER@$IP   (js2 setup $name next; env: source $MOUNT/env.sh)"
+    ;;
+  list)
+    { servers_json; echo '@@'; "$OSC" volume list -f json; } | python3 -c '
+import json,sys,ipaddress
+srv,vol=sys.stdin.read().split("@@")
+bysrv={}
+for v in json.loads(vol):
+    for a in v.get("Attached to") or []: bysrv.setdefault(a["server_id"],[]).append("%s(%dG)"%(v["Name"] or v["ID"][:8],v["Size"]))
+for s in json.loads(srv):
+    ip=[i for v in s["Networks"].values() for i in v if ipaddress.ip_address(i).is_global]
+    print("%-22s %-18s %-10s %-16s vol:%s" % (s["Name"], s["Status"], s["Flavor"], ip[0] if ip else "-", ",".join(bysrv.get(s["ID"],[])) or "-"))'
+    ;;
+  status)
+    inst=$(resolve_inst "${1:-}")
+    "$OSC" server show "$inst" -c name -c status -c flavor -c addresses -c volumes_attached -c created -c key_name
+    ;;
+  gpus)
+    pick_inst "$@"; ssh_dest "$inst"
+    rssh 'nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader'
+    ;;
+  setup)
+    pick_inst "$@"; shift $SHIFTED; mode="${1:-venv}"
+    ssh_dest "$inst"
+    rscp "$SKILL_SCRIPTS/js2_remote.sh" "$SSH_USER@$IP:/tmp/js2_remote.sh"
+    rssh "bash /tmp/js2_remote.sh setup $mode $MOUNT" 2>&1 | tail -8
+    ;;
+  ft)
+    pick_inst "$@"; shift $SHIFTED; ssh_dest "$inst"
+    rscp "$SKILL_SCRIPTS/js2_ft.py" "$SSH_USER@$IP:$MOUNT/js2_ft.py"
+    tt=(); [ -t 0 ] && tt=(-t)
+    exec ssh "${SSH_OPTS[@]}" "${tt[@]}" "$SSH_USER@$IP" "source $MOUNT/venv_sft/bin/activate && cd $MOUNT && python js2_ft.py $* 2>&1 | grep -vE 'jit_monitor|^W[0-9]{4} |Unsloth: Will|🦥|^$'"
+    ;;
+  ssh)
+    pick_inst "$@"; shift $SHIFTED; ssh_dest "$inst"
+    exec ssh "${SSH_OPTS[@]}" "$SSH_USER@$IP" "$@"
+    ;;
+  push-code)
+    inst=$(resolve_inst "${1:-}"); ssh_dest "$inst"
+    rssh "mkdir -p '$EXP_REMOTE'"
+    rsync -avz "${COMMON_EX[@]}" "${CODE_PAT[@]}" -e "$RSYNC_SSH" "$EXP_LOCAL/" "$SSH_USER@$IP:$EXP_REMOTE/"
+    verify_sync "$EXP_LOCAL/" "$SSH_USER@$IP:$EXP_REMOTE/" "${CODE_PAT[@]}"
+    ;;
+  pull-results)
+    pick_inst "$@"; shift $SHIFTED; sub="${1:-}"; ssh_dest "$inst"
+    rsync -avz "${COMMON_EX[@]}" "${RESULT_PAT[@]}" -e "$RSYNC_SSH" "$SSH_USER@$IP:$EXP_REMOTE/$sub" "$EXP_LOCAL/$sub"
+    verify_sync "$SSH_USER@$IP:$EXP_REMOTE/$sub" "$EXP_LOCAL/$sub" "${RESULT_PAT[@]}"
+    check_stale_pulls "$EXP_LOCAL/$sub"
+    ;;
+  up)
+    echo "WARNING: 'js2 up' pushes the WHOLE tree and overwrites instance results with stale local copies. Use push-code unless seeding." >&2
+    inst=$(resolve_inst "${1:-}"); ssh_dest "$inst"
+    rssh "mkdir -p '$EXP_REMOTE'"
+    rsync -avz --no-owner --no-group --exclude '.git' --exclude '__pycache__' --exclude '.venv*' --exclude 'venv' -e "$RSYNC_SSH" "$EXP_LOCAL/" "$SSH_USER@$IP:$EXP_REMOTE/"
+    ;;
+  down)
+    echo "WARNING: 'js2 down' pulls the WHOLE tree and overwrites local SOURCE edits. Use pull-results instead." >&2
+    pick_inst "$@"; shift $SHIFTED; sub="${1:-}"; ssh_dest "$inst"
+    rsync -avz --no-owner --no-group --exclude '__pycache__' --exclude '.venv*' --exclude 'venv' -e "$RSYNC_SSH" "$SSH_USER@$IP:$EXP_REMOTE/$sub" "$EXP_LOCAL/$sub"
+    ;;
+  serve)
+    pick_inst "$@"; shift $SHIFTED
+    model="${1:?usage: js2 serve [inst] <model> [vllm args...]}"; shift || true
+    ssh_dest "$inst"
+    # GPU-aware defaults so the card is fully used (override any of them by passing the flag yourself):
+    #   g3.medium/large = A100 vGPU slice (10/20 GB): util 0.90, small batches
+    #   g3.xl = A100 40 GB: util 0.92, vLLM's A100 defaults are conservative -> seqs 512, batched tokens 4096
+    #   g5.xl = H100 80 GB: util 0.95, seqs 1024, batched tokens 16384
+    #   >1 GPU (multi-GPU flavor) and no -tp/-dp given: tensor-parallel over all of them
+    ngpu=$(rssh 'nvidia-smi -L | wc -l' | tr -d '[:space:]')
+    mem=$(rssh 'nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0' | tr -d '[:space:]')
+    if [ "${ngpu:-1}" -gt 1 ] && ! grep -qE '(^| )(--tensor-parallel-size|--data-parallel-size|--pipeline-parallel-size|-tp|-dp|-pp)([ =]|$)' <<<"$*"; then
+      echo "NOTE: $ngpu GPUs, no parallelism flag given: adding --tensor-parallel-size $ngpu (use --data-parallel-size $ngpu if the model fits one card)" >&2
+      set -- "$@" --tensor-parallel-size "$ngpu"
+    fi
+    grep -q -- '--max-model-len' <<<"$*" || echo "WARNING: no --max-model-len: vLLM uses the model's maximum context, which shrinks concurrency. Set it from the task (see skill)." >&2
+    if   [ "${mem:-0}" -ge 70000 ]; then util=0.95; seqs=1024; btok=16384
+    elif [ "${mem:-0}" -ge 30000 ]; then util=0.92; seqs=512;  btok=4096
+    elif [ "${mem:-0}" -ge 15000 ]; then util=0.90; seqs=256;  btok=4096
+    else                                 util=0.90; seqs=128;  btok=2048; fi
+    grep -q -- '--gpu-memory-utilization' <<<"$*" || set -- "$@" --gpu-memory-utilization "$util"
+    grep -q -- '--max-num-seqs' <<<"$*" || set -- "$@" --max-num-seqs "$seqs"
+    grep -q -- '--max-num-batched-tokens' <<<"$*" || set -- "$@" --max-num-batched-tokens "$btok"
+    echo "serving on ${ngpu}x ${mem} MiB: $*" >&2
+    # venv if present (JS2_SERVE_MODE=docker forces the container); the docker runner is written as a file to
+    # avoid nested quoting; it binds the server to 127.0.0.1 and mounts the HF cache + env.sh's HF_TOKEN
+    if [ "${JS2_SERVE_MODE:-venv}" = venv ] && rssh "test -x $MOUNT/venv/bin/vllm"; then
+      run="source $MOUNT/env.sh && vllm serve $model --host 127.0.0.1 --port 8000 $*"
+    else
+      rssh "cat > $MOUNT/vllm_docker.sh" <<EOT
+#!/usr/bin/env bash
+tok=\$(sed -n 's/^export HF_TOKEN=//p' $MOUNT/env.sh | sed 's/["'"'"']//g' | head -1)
+exec sudo docker run --rm --gpus all --ipc=host -p 127.0.0.1:8000:8000 \\
+  -v $MOUNT/hf:/root/.cache/huggingface -e HF_HUB_DISABLE_XET=1 -e VLLM_USE_FLASHINFER_SAMPLER=0 \\
+  \${tok:+-e HF_TOKEN=\$tok} vllm/vllm-openai:latest "\$@"
+EOT
+      run="bash $MOUNT/vllm_docker.sh $model $*"
+    fi
+    rssh "tmux kill-session -t vllm 2>/dev/null; tmux new-session -d -s vllm \"$run 2>&1 | tee $MOUNT/vllm_serve.log\""
+    echo "waiting for vLLM server on $inst (model load/download can take minutes)..."
+    ok=""
+    for _ in $(seq 1 180); do
+      if rssh 'curl -sf localhost:8000/v1/models >/dev/null'; then ok=1; break; fi
+      rssh 'tmux has-session -t vllm 2>/dev/null' || { echo "vllm serve exited - last log lines:" >&2; rssh "tail -20 $MOUNT/vllm_serve.log" >&2; exit 1; }
+      sleep 10
+    done
+    [ -n "$ok" ] || { echo "server not ready after 30 min - check $MOUNT/vllm_serve.log" >&2; exit 1; }
+    exec "$0" tunnel "$inst"
+    ;;
+  tunnel)
+    inst=$(resolve_inst "${1:-}"); ssh_dest "$inst"
+    lport="${JS2_LOCAL_PORT:-8000}"; pidfile="$HOME/.jetstream2/tunnel.pid"
+    [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null; rm -f "$pidfile"
+    setsid ssh "${SSH_OPTS[@]}" -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N -L "$lport":localhost:8000 "$SSH_USER@$IP" </dev/null >/dev/null 2>&1 &
+    echo $! > "$pidfile"; sleep 3
+    kill -0 "$(cat "$pidfile")" 2>/dev/null || { echo "tunnel died - is local port $lport busy? (override with JS2_LOCAL_PORT)" >&2; rm -f "$pidfile"; exit 1; }
+    echo "endpoint ready: http://localhost:$lport/v1 (tunnel pid $(cat "$pidfile"))"
+    ;;
+  stop)
+    inst=$(resolve_inst "${1:-}")
+    [ -f "$HOME/.jetstream2/tunnel.pid" ] && { kill "$(cat "$HOME/.jetstream2/tunnel.pid")" 2>/dev/null || true; rm -f "$HOME/.jetstream2/tunnel.pid"; }
+    "$OSC" server shelve "$inst"
+    wait_status "$inst" SHELVED_OFFLOADED 600
+    echo "shelved $inst: no SU burn; disk, volume and floating IP kept. js2 start $inst to resume."
+    ;;
+  start)
+    inst=$(resolve_inst "${1:-}")
+    st=$(inst_status "$inst")
+    case "$st" in
+      SHELVED*) "$OSC" server unshelve "$inst" ;;
+      SHUTOFF) "$OSC" server start "$inst" ;;
+      ACTIVE) ;;
+      *) echo "$inst is $st - wait or js2 status" >&2; exit 1 ;;
+    esac
+    wait_status "$inst" ACTIVE 900
+    ssh_dest "$inst"
+    # attached volumes come back attached but unmounted unless fstab has them; the mount script added an fstab line
+    rssh "mountpoint -q $MOUNT || sudo mount -a"; rssh "mountpoint -q $MOUNT && echo '$MOUNT mounted' || echo 'NOTE: no volume mounted at $MOUNT'"
+    echo "ready: ssh $SSH_USER@$IP"
+    ;;
+  finish)
+    inst=$(resolve_inst "${1:-}")
+    "$0" pull-results "$inst" || { echo "pull-results failed - NOT deleting $inst" >&2; exit 1; }
+    echo "results verified; deleting $inst"
+    exec "$0" kill "$inst"
+    ;;
+  kill)
+    if [ -n "${1:-}" ] && ! is_inst "$1"; then echo "no such instance: $1" >&2; exit 1; fi
+    inst=$(resolve_inst "${1:-}")
+    ip=$(inst_ip "$inst" || true)
+    [ -f "$HOME/.jetstream2/tunnel.pid" ] && { kill "$(cat "$HOME/.jetstream2/tunnel.pid")" 2>/dev/null || true; rm -f "$HOME/.jetstream2/tunnel.pid"; }
+    "$OSC" server delete --wait "$inst"
+    [ -n "$ip" ] && "$OSC" floating ip delete "$ip" 2>/dev/null || true
+    echo "deleted $inst (volumes persist, now detached: js2 vol list)"
+    ;;
+  vol)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      list) "$OSC" volume list -f json | python3 -c '
+import json,sys
+for v in json.load(sys.stdin):
+    a=v.get("Attached to") or []
+    print("%-24s %-10s %5d GB  %s" % (v["Name"] or v["ID"][:8], v["Status"], v["Size"], ("-> "+a[0]["server_id"][:8]+" "+a[0]["device"]) if a else "detached"))' ;;
+      create) name="${1:?vol create <name> [GB]}"; gb="${2:-$VOLUME_GB}"
+        "$OSC" volume create --size "$gb" "$name" -f value -c id -c status ;;
+      attach) pick_inst "$@"; shift $SHIFTED; vol="${1:?vol attach [inst] <vol>}"; ssh_dest "$inst"; mount_volume "$inst" "$vol" ;;
+      detach) pick_inst "$@"; shift $SHIFTED; vol="${1:?vol detach [inst] <vol>}"; ssh_dest "$inst"
+        vid=$(vol_id "$vol")
+        rssh "sudo umount $MOUNT 2>/dev/null; sudo sed -i '\\#$MOUNT#d' /etc/fstab; sudo systemctl daemon-reload"
+        "$OSC" server remove volume "$inst" "$vid"; echo "detached $vol" ;;
+      delete) vol="${1:?vol delete <vol>}"
+        [ -z "$(vol_attached_to "$(vol_id "$vol")")" ] || { echo "$vol is attached - detach first" >&2; exit 1; }
+        "$OSC" volume delete "$vol"; echo "deleted volume $vol (irreversible)" ;;
+      *) echo "js2 vol list|create <name> [GB]|attach [inst] <vol>|detach [inst] <vol>|delete <vol>" >&2; exit 1 ;;
+    esac
+    ;;
+  *)
+    sed -n '2,/^set -euo/p' "$0" | grep '^#' | sed 's/^# \{0,3\}//'
+    exit 1
+    ;;
+esac
